@@ -23,9 +23,10 @@ module Rake
       @cross_compile = false
       @cross_config_options = []
       @cross_compiling = nil
-      @no_native = false
+      @no_native = (ENV["RAKE_EXTENSION_TASK_NO_NATIVE"] == "true")
       @config_includes = []
-      @ruby_versions_per_platform = {}
+      # Default to an empty list of ruby versions for each platform
+      @ruby_versions_per_platform = Hash.new { |h, k| h[k] = [] }
       @make = nil
     end
 
@@ -46,15 +47,6 @@ module Rake
     end
 
     def define
-      if (defined?(RUBY_ENGINE) && RUBY_ENGINE == 'ironruby')
-        warn_once <<-EOF
-WARNING: You're attempting to (cross-)compile C extensions from a platform
-(#{RUBY_ENGINE}) that does not support native extensions or mkmf.rb.
-Rerun `rake` under MRI Ruby 1.8.x/1.9.x to cross/native compile.
-        EOF
-        return
-      end
-
       super
 
       unless compiled_files.empty?
@@ -124,6 +116,7 @@ Rerun `rake` under MRI Ruby 1.8.x/1.9.x to cross/native compile.
       tmp_path = "#{@tmp_dir}/#{platf}/#{@name}/#{ruby_ver}"
       stage_path = "#{@tmp_dir}/#{platf}/stage"
 
+      siteconf_path = "#{tmp_path}/.rake-compiler-siteconf.rb"
       tmp_binary_path = "#{tmp_path}/#{binary_path}"
       tmp_binary_dir_path = File.dirname(tmp_binary_path)
       stage_binary_path = "#{stage_path}/#{lib_path}/#{binary_path}"
@@ -141,10 +134,27 @@ Rerun `rake` under MRI Ruby 1.8.x/1.9.x to cross/native compile.
       directory lib_binary_dir_path
       directory stage_binary_dir_path
 
+      directory File.dirname(siteconf_path)
+      # Set paths for "make install" destinations
+      file siteconf_path => File.dirname(siteconf_path) do
+        File.open(siteconf_path, "w") do |siteconf|
+          siteconf.puts "require 'rbconfig'"
+          siteconf.puts "require 'mkmf'"
+          siteconf.puts "dest_path = mkintpath(#{File.expand_path(lib_path).dump})"
+          %w[sitearchdir sitelibdir].each do |dir|
+            siteconf.puts "RbConfig::MAKEFILE_CONFIG['#{dir}'] = dest_path"
+            siteconf.puts "RbConfig::CONFIG['#{dir}'] = dest_path"
+          end
+        end
+      end
+
       # copy binary from temporary location to final lib
       # tmp/extension_name/extension_name.{so,bundle} => lib/
-      task "copy:#{@name}:#{platf}:#{ruby_ver}" => [lib_binary_dir_path, tmp_binary_path] do
-        install tmp_binary_path, "#{lib_path}/#{binary_path}"
+      task "copy:#{@name}:#{platf}:#{ruby_ver}" => [lib_binary_dir_path, tmp_binary_path, "#{tmp_path}/Makefile"] do
+        # install in lib for native platform only
+        unless for_platform
+          sh "#{make} install", chdir: tmp_path
+        end
       end
       # copy binary from temporary location to staging directory
       task "copy:#{@name}:#{platf}:#{ruby_ver}" => [stage_binary_dir_path, tmp_binary_path] do
@@ -173,12 +183,12 @@ Java extension should be preferred.
 
       # makefile depends of tmp_dir and config_script
       # tmp/extension_name/Makefile
-      file "#{tmp_path}/Makefile" => [tmp_path, extconf] do |t|
+      file "#{tmp_path}/Makefile" => [tmp_path, extconf, siteconf_path] do |t|
         options = @config_options.dup
 
         # include current directory
         include_dirs = ['.'].concat(@config_includes).uniq.join(File::PATH_SEPARATOR)
-        cmd = [Gem.ruby, "-I#{include_dirs}"]
+        cmd = [Gem.ruby, "-I#{include_dirs}", "-r#{File.basename(siteconf_path)}"]
 
         # build a relative path to extconf script
         abs_tmp_path = (Pathname.new(Dir.pwd) + tmp_path).realpath
@@ -243,6 +253,9 @@ Java extension should be preferred.
       # lib_path
       lib_path = lib_dir
 
+      # Update compiled platform/version combinations
+      @ruby_versions_per_platform[platf] << ruby_ver
+
       # create 'native:gem_name' and chain it to 'native' task
       unless Rake::Task.task_defined?("native:#{@gem_spec.name}:#{platf}")
         task "native:#{@gem_spec.name}:#{platf}" do |t|
@@ -255,7 +268,7 @@ Java extension should be preferred.
           spec.platform = Gem::Platform.new(platf)
 
           # set ruby version constraints
-          ruby_versions = @ruby_versions_per_platform[platf] || []
+          ruby_versions = @ruby_versions_per_platform[platf]
           sorted_ruby_versions = ruby_versions.sort_by do |ruby_version|
             ruby_version.split(".").collect(&:to_i)
           end
@@ -358,8 +371,7 @@ Java extension should be preferred.
         end
 
         # Update cross compiled platform/version combinations
-        ruby_versions = (@ruby_versions_per_platform[for_platform] ||= [])
-        ruby_versions << version
+        @ruby_versions_per_platform[for_platform] << version
 
         define_cross_platform_tasks_with_version(for_platform, version)
 
